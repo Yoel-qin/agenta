@@ -21,17 +21,14 @@ const buildSlackInstallUrl = (projectId: string): string => {
 /**
  * An agent's channel connections and the real actions on them, wired to the channels API.
  * Every reload lands in this hook's state, so the entry point and its open panel agree.
- * Same logic as the desktop host (`web/oss/.../overview/agent/useAgentChannels`).
  */
 export const useAgentChannels = (
     appId: string,
     {
         resolveAgentName,
-        enabled = true,
     }: {
         /** Resolve an agent id to its display name; null when the roster does not hold it. */
         resolveAgentName?: (id: string) => string | null
-        enabled?: boolean
     } = {},
 ) => {
     const [connections, setConnections] = useState<ChannelConnections>(EMPTY_CONNECTIONS)
@@ -72,7 +69,6 @@ export const useAgentChannels = (
     }, [appId, resolve])
 
     useEffect(() => {
-        if (!enabled) return
         let alive = true
         setLoading(true)
         actions
@@ -85,7 +81,7 @@ export const useAgentChannels = (
             alive = false
             reloadSeq.current++
         }
-    }, [actions, enabled])
+    }, [actions])
 
     return {connections, loading, loadError, actions}
 }

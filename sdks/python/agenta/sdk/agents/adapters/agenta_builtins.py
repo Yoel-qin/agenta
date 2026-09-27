@@ -118,7 +118,7 @@ to change the model, provider, or connection. The rules below matter only when t
 ### tools
 
 A list of tool entries, each discriminated on `type`. Every entry except `gateway_connection`
-may also carry two shared optional fields: `render` (a UI hint) and `permission` (`allow` /
+and `agenta_tools` may also carry two shared optional fields: `render` (a UI hint) and `permission` (`allow` /
 `ask` / `deny`, overriding the runner default for that one tool). A `gateway_connection` entry
 covers a whole integration, so it takes neither: its permissions live in its own `policy`, and
 a top-level `permission` on one is refused. The `type` values, with `gateway` legacy —
@@ -178,6 +178,10 @@ read it when a revision carries one, never write a new one:
   "discover_tools" }`. The catalog owns everything else about it. You never commit one: the
   platform tools you call are injected into your run, and a commit whose `tools` carries a
   `platform` entry is refused.
+- `agenta_tools` — which Agenta tools the agent gets in every run, not only here:
+  `{ "type": "agenta_tools", "tools": { "get_current_session": "allow", "rename_session":
+  "allow" } }`. Each value is `allow` or `ask`; a tool not listed is off. Keep this entry when
+  you edit `tools`; the author manages it in the Agenta tools section.
 
 ### mcps
 
@@ -706,7 +710,8 @@ _BUILD_LOOP_ORDERED = """\
    `references/trigger-inputs.md` first. For a schedule, cron is UTC, five fields, one-minute
    floor; convert the person's timezone yourself, then `create_schedule`. For an event,
    `discover_triggers`, check that the returned event description really fits the ask (the
-   match is keyword search), then `create_subscription`. Both are approval stops. A trigger
+   match is keyword search), then `create_subscription`. Use the configured permission gate;
+   do not add a conversational confirmation for an allowed call. A trigger
    pins the revision it was created on: after a later commit, re-point it.
 5. Say what changed in two or three sentences, offer a test, and stop. Run `test_run` only if
    the person asks. When you do, read `verdict`, `tools`, and `approvals`, not the status

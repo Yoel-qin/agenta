@@ -11,6 +11,7 @@ export const AVAILABLE_SETTINGS_TABS: SettingsTabKey[] = [
     "secrets",
     "webhooks",
     "tools",
+    "channels",
     "mcpEndpoints",
     "organizationGeneral",
     "workspace",
@@ -45,9 +46,6 @@ export const useMobileSettingsAccess = (): SettingsAccess => {
             billingEnabled,
             canShowMcpEndpoints: mcpGatewayEnabled,
             canShowTools: toolsEnabled,
-            // Channels live on the agent page here, not in settings: this app has no channels
-            // settings page, and `AVAILABLE_SETTINGS_TABS` lists none, so the flag stays off.
-            canShowChannels: false,
             canViewApiKeys: true,
             canViewEvents: true,
             isEE: enterprise,

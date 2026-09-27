@@ -8,9 +8,11 @@ import {
   resolvePromptText,
   type AgentRunRequest,
   type AgentRunResult,
+  type AgentUsage,
   type EmitEvent,
   type ToolCallbackContext,
 } from "../../protocol.ts";
+import { harnessKindOf } from "../../harness-kind.ts";
 import { sandboxVisibleSecretValues, seedForRun } from "../../redaction.ts";
 import {
   observeSubscription,
@@ -45,6 +47,7 @@ import {
   INTERRUPTED_BY_USER,
   TOOL_NOT_EXECUTED_PAUSED,
 } from "../../tracing/otel.ts";
+import { servedByCustomConnection } from "../../tracing/custom-connection.ts";
 import {
   attachPermissionResponder,
   buildGateDescriptor,
@@ -67,11 +70,13 @@ import {
 } from "./attachments.ts";
 import { describeCodexSubscriptionAuthFault } from "./codex-assets.ts";
 import { linkAgentFiles } from "./agent-mount.ts";
+import { refreshDriveViewsAtTurnStart } from "./turn-start-refresh.ts";
 import {
   recoverSubscriptionAuthFailure,
 } from "./subscription-recovery.ts";
 import {
   classifyRunError,
+  conciseError,
   CREDENTIAL_RACE_REPORTS_PER_SESSION,
   withinCredentialPropagationWindow,
 } from "./errors.ts";
@@ -109,6 +114,7 @@ import {
   RUN_LIMIT_TRIPPED,
   sendLastMessageOnly,
   type CurrentTurn,
+  type InRunnerSessionHandle,
   type ParkedApproval,
   type ParkedApprovedExecution,
   type RunTurnOptions,
@@ -131,7 +137,14 @@ import { mcpHandshakeFailureMessage } from "./mcp-handshake.ts";
 import { reconstructHistoryIfNeeded } from "./reconstruct-history.ts";
 import { carriesApprovalReplyOnly } from "./session-identity.ts";
 import { buildTurnText, priorMessages } from "./transcript.ts";
-import { resolveRunUsage } from "./usage.ts";
+import {
+  awaitEndingPrompt,
+  combinePromptResults,
+  promptTokenDetail,
+  resolveColdPauseUsageSettleMs,
+  resolveRunUsage,
+  turnCostFromRunningTotal,
+} from "./usage.ts";
 
 /**
  * Codex is the one harness that says anything at all when an MCP server fails to start: a
@@ -289,6 +302,60 @@ export async function runTurn(
   // stop this turn's relay on EVERY exit path (a cleared sink must never orphan it).
   let otel: ReturnType<typeof createSandboxAgentOtel> | undefined;
   let activeTurn: CurrentTurn | undefined;
+  // Set once this turn's ledger row is written: a failed turn the harness rolled back completes
+  // its row like any other resume point.
+  let turnLedgerForFailure:
+    | { sessionId: string; turnIndex: number; authorization: string }
+    | undefined;
+  /**
+   * After a failed turn: keep the harness's native session when it can take the failed turn back
+   * out of its transcript, otherwise drop the resume point (the next turn replays).
+   *
+   * Either way what the provider refused leaves the model's context: the replay keeps only the
+   * person's message of a failed turn (`reconstructMessages`). Keeping them made one refusal
+   * permanent, because every retry resent the content the provider refused. A rolled-back turn is a faithful resume point: the
+   * transcript is exactly the completed turns before it, so it records the same pointer and
+   * completes the same ledger row a finished turn does, and the next turn loads it natively.
+   */
+  const settleFailedTurnContinuity = async (): Promise<void> => {
+    let rolledBack = false;
+    // Only a harness in this runner can roll its own transcript back.
+    const session = env.session as Partial<InRunnerSessionHandle> | undefined;
+    if (session?.rollbackFailedTurn) {
+      try {
+        rolledBack = await session.rollbackFailedTurn();
+      } catch (err) {
+        logger(
+          `[continuity] failed-turn rollback failed: ${conciseError(err, plan.harness)}`,
+        );
+      }
+    }
+    const agentSessionId = env.session?.agentSessionId as string | undefined;
+    if (
+      !rolledBack ||
+      !sessionId ||
+      !agentSessionId ||
+      env.continuityTurnIndex === undefined
+    ) {
+      invalidateContinuity(sessionId, plan.harness, deps);
+      return;
+    }
+    continuityStore.record(
+      sessionId,
+      plan.harness,
+      agentSessionId,
+      env.continuityTurnIndex,
+    );
+    const completeTurn = (deps.appendSessionTurn ?? appendSessionTurn).complete;
+    if (turnLedgerForFailure && completeTurn) {
+      await completeTurn(
+        turnLedgerForFailure.sessionId,
+        turnLedgerForFailure.turnIndex,
+        { agentSessionId, endTime: new Date().toISOString() },
+        { authorization: turnLedgerForFailure.authorization, log: logger },
+      ).catch(() => {});
+    }
+  };
   /**
    * Ask the subscription recovery what to do about a failure, or undefined when this run carries
    * no subscription and when the failure is not about the login.
@@ -344,6 +411,7 @@ export async function runTurn(
     request: () => request,
     target: otlpTarget,
     resume: !!opts.resume,
+    nextPromptFollows: !!opts.settleApprovalsThenPrompt,
   });
   // Assigned once the turn's interaction plumbing exists; called from the `finally` so EVERY exit
   // path (done, paused, cancelled, error) settles the durable rows this turn's in-band answers
@@ -488,6 +556,7 @@ export async function runTurn(
     const run = (deps.createOtel ?? createSandboxAgentOtel)({
       harness: plan.harness,
       model: env.model,
+      customConnection: servedByCustomConnection(request.modelConnection),
       skills: plan.workspace.skillDirs.map((s) => s.name),
       skillsDropped: plan.workspace.skillsDropped,
       traceparent: request.context?.propagation?.traceparent,
@@ -613,7 +682,10 @@ export async function runTurn(
     }
     const turnContext = request.turnContext?.trim();
     if (turnContext) {
-      promptBlocks.unshift({ type: "text", text: turnContext });
+      // The blank line is load-bearing: pi-acp joins text blocks with nothing between them, so
+      // without it the facts' last sentence and the user's first word become one line
+      // ("...first turn of the session.hi").
+      promptBlocks.unshift({ type: "text", text: `${turnContext}\n\n` });
     }
 
     const sessionTurnClient = deps.appendSessionTurn ?? appendSessionTurn;
@@ -631,6 +703,7 @@ export async function runTurn(
           }
         : undefined;
     if (turnLedgerContext) {
+      turnLedgerForFailure = turnLedgerContext;
       const workflowRefs = buildWorkflowReferenceList(
         request.runContext?.workflow,
       );
@@ -654,6 +727,11 @@ export async function runTurn(
       ).catch(() => {});
     }
 
+    // A cold pause sends the harness a cancel (`destroySession`). Claude and Codex answer the open
+    // prompt with the usage of the work before the pause; the turn waits briefly for that answer
+    // and, while it waits, lets only usage updates through (see `handleUpdate`).
+    let coldPauseCancelSent = false;
+    let coldPauseSettling = false;
     const pause = new PendingApprovalPauseController(() => {
       // Do NOT force-settle open tool calls here, at first pause. With concurrent approvals a
       // second gated call may still be in flight (its permission request lands a tick after the
@@ -675,6 +753,7 @@ export async function runTurn(
       // session teardown, so its handler cannot write a result after the turn ends.
       env.mcpAbort.abort();
       env.sessionDestroyRequested = true;
+      coldPauseCancelSent = true;
       return env.sandbox.destroySession?.(env.session.id);
     });
     if (opts.resume?.carriedForward.length) {
@@ -736,6 +815,15 @@ export async function runTurn(
       pause,
       toolRelay: undefined,
       handleUpdate: (update) => {
+        // The turn is over and waits only for the cancelled prompt's usage. Anything else the
+        // harness sends now is a teardown artifact (Codex writes "*Conversation interrupted*").
+        if (
+          coldPauseSettling &&
+          (update as { sessionUpdate?: unknown })?.sessionUpdate !==
+            "usage_update"
+        ) {
+          return;
+        }
         const codexMcpFailure = codexMcpStartupFailure(plan.harness, update);
         if (codexMcpFailure) {
           // Never as a tool call (it is synthetic), always as the notice. Skipped when the
@@ -1189,7 +1277,7 @@ export async function runTurn(
     // deletion land on the session drive, which is durable, and the repair moves them onto the
     // agent mount. They arrive one turn late instead of never, for one `lstat` per turn rather
     // than one per tool call on a FUSE mount.
-    if (env.agentMountedPath && !plan.isDaytona) {
+    if (env.agentMountedPath && plan.driveOnRunner) {
       const agentFilesReady = await linkAgentFiles(plan.workspace.cwd, env.agentMountedPath, {
         log: logger,
       });
@@ -1197,6 +1285,10 @@ export async function runTurn(
         throw new Error("agent-files could not be linked to the durable agent mount");
       }
     }
+
+    // Files-pane edits and uploads go straight to the store; refresh the mounts' views so this
+    // turn's first reads and commands see them. Same place and reason as the link repair above.
+    await refreshDriveViewsAtTurnStart(env, plan, logger);
 
     // Non-Pi loopback tools use the correlation index; Pi's relay toolCallId is already exact.
     env.clientToolRelayRef.current = buildClientToolRelay({
@@ -1422,6 +1514,10 @@ export async function runTurn(
         cancelled,
       ]);
     let raced = await racePrompt(promptPromise);
+    // The response of a parked prompt this turn finished before its second prompt. Each prompt
+    // reports only its own work, so a runner-traced turn reports both (the paused turn reported
+    // none).
+    let settledPromptResult: unknown;
     if (
       opts.settleApprovalsThenPrompt &&
       raced !== PAUSED &&
@@ -1434,6 +1530,8 @@ export async function runTurn(
       // prompt the runner silently answers the old denied tool call and drops the new text. The
       // old prompt was raced above, so a harness that opened another gate after the denial pauses
       // this turn instead of hanging unwatched. `continuation` makes promptBlocks the fresh tail.
+      settledPromptResult = raced;
+      await harnessTrace.beginNextPrompt(run, runRedactor);
       promptStartedAtMs = Date.now();
       promptPromise = Promise.resolve(env.session.prompt(promptBlocks));
       promptPromise.catch(() => {});
@@ -1543,6 +1641,17 @@ export async function runTurn(
         noteExecutionSettled(request.sessionId, request.turnId);
       }
     }
+    // A cold pause or a user Stop ends the prompt with a cancel. Its answer is the only report of
+    // the work before the cancel: the runner raced past the prompt, and a later turn counts only
+    // its own work. Pi reports that work in its usage sidecar instead (drained below).
+    let cancelledPromptResult: unknown;
+    if (stopReason === "paused" && coldPauseCancelSent && !plan.isPi) {
+      coldPauseSettling = true;
+      cancelledPromptResult = await awaitEndingPrompt(
+        promptPromise,
+        resolveColdPauseUsageSettleMs(),
+      );
+    }
     if (stopReason === "cancelled") {
       env.parkedApprovals.clear();
       env.parkedApproval = undefined;
@@ -1559,6 +1668,14 @@ export async function runTurn(
         log: logger,
       });
       cancelSettled = cancel.settled;
+      // A settled cancel means the prompt already answered, so this read does not wait. The
+      // frames of the cancel window keep their normal routing: a Stop honors real completions.
+      if (cancel.settled && !plan.isPi) {
+        cancelledPromptResult = await awaitEndingPrompt(
+          promptPromise,
+          resolveColdPauseUsageSettleMs(),
+        );
+      }
       // Codex leaves its shell child running inside the sandbox we are about to park; Pi and
       // Claude kill theirs. Reap it here, never in the bridge: the Codex shell is a child of a
       // vendored Rust binary the JS bridge holds no pid for, and a bridge patch would ship only
@@ -1616,17 +1733,41 @@ export async function runTurn(
     // batch first is therefore the cross-filesystem publication barrier for both local and
     // Daytona runs. Runner-traced harnesses still need usage before trace finalization so the
     // runner can stamp it on its own span.
+    //
+    // A pause that destroyed the Pi session (no approval park) ends the prompt for good: Pi
+    // publishes the partial trace and usage of the work before the pause as it stops. Drain them
+    // here too, so this turn reports that usage instead of racing Pi's write. A parked prompt is
+    // still running and publishes on the turn that resumes it.
     let traceFinish =
-      plan.isPi && stopReason !== "paused"
+      plan.isPi && (stopReason !== "paused" || env.sessionDestroyRequested)
         ? await harnessTrace.finish()
         : undefined;
-    const usage = await resolveRunUsage({
-      sandbox: env.sandbox,
-      usageOutPath: plan.workspace.usageOutPath,
-      isDaytona: plan.isDaytona,
-      promptResult: result,
-      streamUsage: run.usage(),
-    });
+    // Pi traces the parked prompt under the paused turn's trace, and the platform totals that trace
+    // from those spans. Its usage stays out of this turn's, which would count it on a second root.
+    // A pure approval resume runs only the parked prompt, so it reports no usage at all.
+    const turnPromptResult = plan.isPi
+      ? result
+      : combinePromptResults(
+          settledPromptResult,
+          result ?? cancelledPromptResult,
+        );
+    const resolvedUsage =
+      plan.isPi && opts.resume
+        ? undefined
+        : await resolveRunUsage({
+            sandbox: env.sandbox,
+            usageOutPath: plan.workspace.usageOutPath,
+            isDaytona: plan.isDaytona,
+            promptResult: turnPromptResult,
+            streamUsage: run.usage(),
+          });
+    const isClaude = harnessKindOf(plan.harness) === "claude";
+    const usage = isClaude
+      ? claudeTurnUsage(resolvedUsage, env)
+      : resolvedUsage;
+    run.setTokenDetail?.(
+      promptTokenDetail(turnPromptResult, { perModel: isClaude }),
+    );
     run.setUsage(usage);
     if (!plan.isPi && stopReason !== "paused") {
       traceFinish = await harnessTrace.finish();
@@ -1704,6 +1845,7 @@ export async function runTurn(
             // race that arrives THIS way is the identical failure wearing a different shape —
             // and without the predicate it would still be reported as the user's key problem.
             daytonaCredentialFresh: reportCredentialRace,
+            unknownText: plan.unknownErrorText,
           },
         );
       swallowedError = classified.message;
@@ -1721,9 +1863,9 @@ export async function runTurn(
     const turnEndedAt = new Date().toISOString();
 
     if (swallowedError) {
-      // A failed turn may have left a partial turn in the native transcript: the prior record
-      // is no longer a faithful resume point.
-      invalidateContinuity(sessionId, plan.harness, deps);
+      // A failed turn may have left a partial turn in the native transcript: roll it back, or
+      // drop the resume point.
+      await settleFailedTurnContinuity();
       // The envelope is attached HERE for the folded-refusal path, because its message has had
       // the marker stripped out: `withGatewayErrorDetail` scans the text and would find nothing
       // left to recover. The Pi path keeps its text intact and is recovered there as before.
@@ -1753,9 +1895,23 @@ export async function runTurn(
     // Still dropped, unchanged: a pause has not finished authoring the turn, and an UNSETTLED
     // cancel leaves the harness in an unknown state, possibly still writing. Both fall back to
     // cold replay, which is the always-correct floor.
+    //
+    // Also dropped: a turn whose native transcript did not reach durable storage (an in-runner
+    // harness saves it at the turn's end, bounded). Loading that transcript after a restart would
+    // silently leave the turn out of the model's context; the replay keeps it.
+    const nativeHistorySaved =
+      (
+        env.session as Partial<InRunnerSessionHandle> | undefined
+      )?.nativeHistorySaved?.() !== false;
     const turnIsResumePoint =
       stopReason !== "paused" && (stopReason !== "cancelled" || cancelSettled);
-    if (
+    if (turnIsResumePoint && !nativeHistorySaved) {
+      logger(
+        `[continuity] native transcript behind the turn's records session=${sessionId ?? "-"}; ` +
+          "the next cold turn replays",
+      );
+      invalidateContinuity(sessionId, plan.harness, deps);
+    } else if (
       turnIsResumePoint &&
       env.continuityTurnIndex !== undefined &&
       sessionId
@@ -1793,7 +1949,8 @@ export async function runTurn(
       output,
       messages: output ? [{ role: "assistant", content: output }] : [],
       events: emit ? [] : run.events(),
-      usage,
+      // The tracer's usage: the counts its model span carries (see `setUsage`).
+      usage: run.usage(),
       stopReason,
       ...(stopReason === "cancelled" ? { cancelSettled } : {}),
       capabilities: {
@@ -1816,6 +1973,7 @@ export async function runTurn(
           deployment: request.modelConnection?.deployment,
         },
         daytonaCredentialFresh: reportCredentialRace,
+        unknownText: plan.unknownErrorText,
       },
     );
     // A hosted subscription run has no vault key, so the generic "add a key" advice would send the
@@ -1836,8 +1994,9 @@ export async function runTurn(
       await harnessTrace.emitMissingBatchFallback(otel, error);
     }
     otel?.emitEvent(errorEventWithDetail(error, classified.code));
-    // An aborted turn may have left a partial turn in the native transcript.
-    invalidateContinuity(sessionId, plan.harness, deps);
+    // An aborted turn may have left a partial turn in the native transcript: roll it back, or
+    // drop the resume point.
+    await settleFailedTurnContinuity();
     // Same ordering as the happy path: settle the durable rows before the terminal record goes out.
     await settleInBandInteractions?.();
     // finish() must not throw uncaught — tracing must not mask the run error.
@@ -1869,4 +2028,23 @@ export async function runTurn(
     // megabytes of frozen content.
     if (env.parkedApprovals.size === 0) env.commitAuthorization = undefined;
   }
+}
+
+/**
+ * Replace Claude Code's session-wide running cost with this turn's share, and remember the
+ * reading on the live environment for the next turn.
+ */
+function claudeTurnUsage(
+  usage: AgentUsage | undefined,
+  env: { harnessCostReading?: number; loadedFromContinuity: boolean },
+): AgentUsage | undefined {
+  if (!usage || usage.cost == null) return usage;
+  const cost = turnCostFromRunningTotal(
+    usage.cost,
+    env.harnessCostReading,
+    env.loadedFromContinuity,
+  );
+  env.harnessCostReading = usage.cost;
+  const { cost: _runningTotal, ...tokens } = usage;
+  return cost == null ? tokens : { ...tokens, cost };
 }

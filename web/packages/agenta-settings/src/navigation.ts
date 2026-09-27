@@ -26,7 +26,6 @@ export interface SettingsAccess {
     canShowTools: boolean
     canViewApiKeys: boolean
     canViewEvents: boolean
-    canShowChannels: boolean
     isEE: boolean
     isOwner: boolean
 }
@@ -81,7 +80,8 @@ export const SETTINGS_TABS: SettingsTabDefinition[] = [
     {
         key: "channels",
         scope: "project",
-        description: "Let agents answer in Slack and other messaging platforms.",
+        description:
+            "Chat platforms connected to this project. Each connection answers as one agent.",
     },
     {
         key: "webhooks",
@@ -208,9 +208,6 @@ export const isSettingsTabVisible = (key: SettingsTabKey, access: SettingsAccess
             return access.canViewApiKeys
         case "tools":
             return access.canShowTools
-        case "channels":
-            return access.canShowChannels
-
         case "mcpEndpoints":
             return access.canShowMcpEndpoints
         case "organization":

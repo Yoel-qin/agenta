@@ -18,11 +18,12 @@ import {
     type BuildKitUiState,
 } from "@agenta/entities/workflow"
 import {getEnabledSandboxProviders} from "@agenta/shared/api"
+import {inprocessSandboxEnabledAtom} from "@agenta/shared/state"
 import {normalizeProviderFamily} from "@agenta/shared/utils"
 import {ConfigAccordionSection} from "@agenta/ui/components/presentational"
 import {useDrillInUI} from "@agenta/ui/drill-in"
 import {SelectLLMProviderBase} from "@agenta/ui/select-llm-provider"
-import {Cube, Key, Wrench} from "@phosphor-icons/react"
+import {Cube, Key, Toolbox, Wrench} from "@phosphor-icons/react"
 import {atom, useAtomValue, useSetAtom} from "jotai"
 
 import {useHasChangedUnder, useRevertUnder} from "../../../drawers/shared/ChangedPathsContext"
@@ -58,9 +59,11 @@ import {
     permissionPolicyOptionsForEnum,
 } from "../permissionPolicy"
 
+import {useAgentaTools} from "./AgentaToolsSection"
 import {AgentSecretsSection} from "./AgentSecretsSection"
 import {effectiveHarnessValue, enumLabel} from "./agentTemplateUtils"
 import {CatalogUnavailableNotice} from "./CatalogUnavailableNotice"
+import {INTEGRATION_DRAWER_WIDTH} from "./drawerWidths"
 import ModelPickerControl from "./ModelPickerControl"
 import {PermissionPolicySelect} from "./PermissionPolicySelect"
 import {shouldPromptForProviderKey} from "./providerKeyPrompt"
@@ -117,10 +120,7 @@ export function useModelHarness({
     const harnessProps = subProps("harness")
     const runnerProps = subProps("runner")
     const sandboxProps = subProps("sandbox")
-    const sandboxOptions = useMemo(() => {
-        const enabled = new Set(getEnabledSandboxProviders())
-        return getEnumOptions(sandboxProps.kind).filter((o) => enabled.has(o.value))
-    }, [sandboxProps.kind])
+    const inprocessSandboxEnabled = useAtomValue(inprocessSandboxEnabledAtom)
 
     const asObject = useCallback(
         (key: string): Record<string, unknown> =>
@@ -132,6 +132,20 @@ export function useModelHarness({
     const harness = asObject("harness")
     const runner = asObject("runner")
     const sandbox = asObject("sandbox")
+    const savedSandboxKind = typeof sandbox.kind === "string" ? sandbox.kind : null
+    // The preference only hides `inprocess` from a new choice. An agent already saved with it keeps
+    // it listed, so the normalize effect below never rewrites it: the flag reads off on the first
+    // render (the user id settles a tick later) and while a user has it off.
+    const sandboxOptions = useMemo(() => {
+        const enabled = new Set(getEnabledSandboxProviders())
+        return getEnumOptions(sandboxProps.kind).filter(
+            (o) =>
+                enabled.has(o.value) &&
+                (o.value !== "inprocess" ||
+                    inprocessSandboxEnabled ||
+                    savedSandboxKind === "inprocess"),
+        )
+    }, [sandboxProps.kind, inprocessSandboxEnabled, savedSandboxKind])
 
     const secretBindings = Array.isArray(sandbox.credentials)
         ? sandbox.credentials.filter((value): value is AgentSecretBinding => {
@@ -166,16 +180,15 @@ export function useModelHarness({
         (key: string, fieldValue: unknown) => onChange({...config, [key]: fieldValue}),
         [config, onChange],
     )
-    const sandboxValue = typeof sandbox.kind === "string" ? sandbox.kind : null
     useEffect(() => {
         if (disabled || !normalizeSandbox) return
-        const availableValue = sandboxOptions.some((option) => option.value === sandboxValue)
-            ? sandboxValue
+        const availableValue = sandboxOptions.some((option) => option.value === savedSandboxKind)
+            ? savedSandboxKind
             : (sandboxOptions[0]?.value ?? null)
-        if (availableValue && availableValue !== sandboxValue) {
+        if (availableValue && availableValue !== savedSandboxKind) {
             setSection("sandbox", {...sandbox, kind: availableValue})
         }
-    }, [disabled, normalizeSandbox, sandbox, sandboxOptions, sandboxValue, setSection])
+    }, [disabled, normalizeSandbox, sandbox, sandboxOptions, savedSandboxKind, setSection])
 
     // Model + credential connection (`llm`). It is ALWAYS a structured object (the harness-filtered
     // picker only ever produces one); a legacy bare string is read for display. composeModelValue
@@ -401,6 +414,12 @@ export function useModelHarness({
     // "Policy · Allow all" — the label lives here, so the body's select can run full width.
     const runnerPermissionSummary = `Policy · ${permissionPolicyLabel(currentRunnerPermission)}`
 
+    const agentaToolsSection = useAgentaTools({
+        config,
+        onChange,
+        revisionId: revisionId ?? null,
+        disabled,
+    })
     const {hasBuildKitOverlay, buildKitSection} = useBuildKit({
         revisionId: revisionId ?? null,
         disabled,
@@ -672,6 +691,7 @@ export function useModelHarness({
 
     const advancedControls = (
         <>
+            {focus.active ? null : agentaToolsSection}
             {/* Playground-only overlay — it owns no committed property, so a focus filter drops it. */}
             {focus.active ? null : buildKitSection}
 
@@ -743,6 +763,14 @@ export function useModelHarness({
                     extra: <span ref={setSecretsHeaderSlot} className="flex shrink-0" />,
                 },
                 body: secretsBody,
+            },
+            agentaToolsSection && {
+                item: {
+                    value: "agenta-tools",
+                    label: "Agenta tools",
+                    icon: <Toolbox size={14} />,
+                },
+                body: agentaToolsSection,
             },
             hasBuildKitOverlay && {
                 item: {
@@ -837,7 +865,6 @@ export function useModelHarness({
         runnerPermissionSummary,
         advancedSummary,
         advancedDrawerBody,
-        // Rail + one panel at a time; 50px over the Model drawer so the build-kit rows breathe.
-        advancedDrawerWidth: 610,
+        advancedDrawerWidth: INTEGRATION_DRAWER_WIDTH,
     }
 }

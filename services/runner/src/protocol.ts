@@ -231,6 +231,15 @@ export interface RunContext {
   session?: {
     id?: string;
   };
+  /**
+   * The tool call being dispatched, filled by the relay for each direct call and never by the
+   * service. Its id stays the same when the same call is relayed again (a resumed approval
+   * reuses it), so an endpoint can key a side effect on it and answer a retry without repeating
+   * the effect.
+   */
+  tool?: {
+    call_id?: string;
+  };
   workflow?: {
     artifact?: RunContextReference;
     variant?: RunContextReference;
@@ -548,7 +557,24 @@ export interface AgentUsage {
   input: number;
   output: number;
   total: number;
-  cost: number;
+  /**
+   * INVARIANT: absent means the cost is UNKNOWN (the harness reported none); a present `0` is a
+   * measured zero — a free model or a fully cached turn. Consumers read presence as evidence of
+   * a measurement, so a producer must never substitute a zero for an absence: doing so records
+   * an unpriced run as a free one, which every downstream aggregate then believes.
+   */
+  cost?: number;
+}
+
+/**
+ * Token counts of a turn, as the tracer stamps them on its model span. Input is EXCLUSIVE of
+ * cache: reads and writes are separate counts. Runner-internal, never on the wire.
+ */
+export interface ModelTokenUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
 }
 
 /**
@@ -716,6 +742,12 @@ export interface ModelConnection {
   /** Our own credentials for the gateway. Independent of `credentialMode`, which describes the
    * provider's secret. Omitted when the model is not reached through a gateway. */
   gatewayCredentials?: GatewayCredentials;
+  /**
+   * True when the route serves the user's own custom-provider record, false when it serves a
+   * provider key. The SDK resolver knows the record kind and states it; omitted by older SDKs,
+   * in which case only a `custom` deployment counts (`servedByCustomConnection`).
+   */
+  customConnection?: boolean;
 }
 
 /**

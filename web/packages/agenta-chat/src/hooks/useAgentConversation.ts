@@ -46,6 +46,7 @@ import {useSetAtom, useStore} from "jotai"
 
 import {latestTurnId} from "../assets/agentTurn"
 import {buildRequestWithinDeadline} from "../assets/boundedRequest"
+import type {CommittedRevision} from "../assets/committedRevisions"
 import {prepareAfterContinuationPreflight} from "../assets/continuationPreflight"
 import {
     displayMessageText,
@@ -178,6 +179,8 @@ export interface UseAgentConversationArgs {
      * silently folded every client tool into the plain "used N tools" group, leaving the run
      * parked with nothing on screen to answer. */
     isClientToolPart?: ClientToolPartPredicate
+    /** The agent committed itself in this session; durable sends learn it from the records. */
+    onCommittedRevision?: (revision: CommittedRevision) => void
 }
 
 export interface AgentConversation {
@@ -278,6 +281,7 @@ export const useAgentConversation = ({
     onSendAccepted,
     onSendFailed,
     isClientToolPart,
+    onCommittedRevision,
 }: UseAgentConversationArgs): AgentConversation => {
     // Declared FIRST, so its effect re-arms before any effect below can capture a generation.
     // `state/sessionChats.ts` deliberately preserves the same `Chat` across a remount, so an
@@ -756,8 +760,7 @@ export const useAgentConversation = ({
         stopped,
         continuationExecutionId,
         // Not wired on this host yet: the composer lives below this hook and has no handle here,
-        // so a late refusal keeps its flagged row instead of restoring the draft. Pass a restorer
-        // in to unify it with the desktop.
+        // so a late refusal keeps its flagged row instead of restoring the draft.
         restoreRefusedSend,
         onSendAccepted,
         onSendFailed,
@@ -1060,6 +1063,7 @@ export const useAgentConversation = ({
         },
         onExecutionSettled: settleAcceptedRun,
         onDisconnect: revalidate,
+        onCommittedRevision,
     })
     const includePreview = turnDeliverySource !== "legacy"
     const displayMessages = useMemo(() => {
@@ -1250,8 +1254,7 @@ export const useAgentConversation = ({
         [regenerate, sessionId, setMessages],
     )
 
-    // Per-mount executed-identity cache — the desktop's per-message toolSignature memo,
-    // recreated hook-side so the identity JSON.stringify doesn't re-run per streamed token.
+    // Per-mount executed-identity cache, so the identity JSON.stringify doesn't re-run per streamed token.
     const [executedFor] = useState(() => createExecutedToolIdentityCache())
     // Per-mount view-model cache: unchanged turns keep object identity, so `TurnRow`'s memo holds.
     const [turnCache] = useState(() => createTurnViewModelCache())
